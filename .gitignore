@@ -1,0 +1,8 @@
+myenv/
+venv/
+db.sqlite3
+.vscode/
+__pycache__/
+*.log
+*.pyc
+ecommerce-output.txt
