@@ -1,8 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import User 
 
-# Create your models here.
-
 class Product(models.Model):
     name = models.CharField(max_length=225)
     stock = models.IntegerField()
@@ -27,7 +25,6 @@ class OrderItem(models.Model):
     
 class DailySalesReport(models.Model):    
     date = models.DateField(unique=True)
-    # إحصائيات المبيعات
     total_orders = models.IntegerField(default=0)
     completed_orders = models.IntegerField(default=0)
     cancelled_orders = models.IntegerField(default=0)
@@ -39,13 +36,9 @@ class DailySalesReport(models.Model):
     # average_order_value هو متوسط قيمة الطلب الواحد
     average_order_value = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     
-    # البيانات الإحصائية
     total_items_sold = models.IntegerField(default=0)
     unique_customers = models.IntegerField(default=0)
-    # top_product_name = models.CharField(max_length=225, null=True, blank=True)
-    # top_product_quantity = models.IntegerField(default=0)
     
-    # معالجة البيانات
     status = models.CharField(
         max_length=20,
         choices=[
@@ -57,7 +50,6 @@ class DailySalesReport(models.Model):
         default='PENDING'
     )
     
-    # معلومات المعالجة
     chunks_processed = models.IntegerField(default=0)
     batch_size = models.IntegerField(default=100)
     processing_time_seconds = models.FloatField(default=0)

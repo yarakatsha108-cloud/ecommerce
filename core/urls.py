@@ -1,12 +1,14 @@
 from rest_framework.routers import DefaultRouter
 from .views import register
 from django.urls import path
-# from .views import ProductListCreateAPIView, ProductDetailAPIView , OrderDetailAPIView , OrderListCreateAPIView , PayOrderAPIView , CancelOrderAPIView ,CompleteOrderAPIView
+from .views import DashboardStatsAPIView, CacheDiagnosticsAPIView
 from .views import (
-    ProductListCreateAPIView, ProductDetailAPIView , OrderDetailAPIView , OrderListCreateAPIView , 
-    PayOrderAPIView , CancelOrderAPIView ,CompleteOrderAPIView,
+    ProductListCreateAPIView, ProductDetailAPIView, OrderDetailAPIView, OrderListCreateAPIView,
+    PayOrderAPIView, CancelOrderAPIView, CompleteOrderAPIView,
     DailySalesReportListAPIView, DailySalesReportDetailAPIView,
-    ProcessDailySalesAPIView, SalesReportStatsAPIView
+    ProcessDailySalesAPIView, SalesReportStatsAPIView,
+    DashboardStatsAPIView, CacheDiagnosticsAPIView,  
+    register,
 )
 from .monitoring_views import (
     resource_status_view,
@@ -31,11 +33,13 @@ urlpatterns = [
     path('reports/process/', ProcessDailySalesAPIView.as_view()),
     path('reports/stats/', SalesReportStatsAPIView.as_view()),
     
-    # Monitoring & Admin endpoints
     path('admin/resources/', resource_status_view),
     path('admin/capacity/', capacity_status_view),
     path('admin/health/', system_health_view),
     path('admin/capacity/reset/', reset_capacity_stats_view),
     path('admin/async-queue/', async_queue_status_view),
+
+    path('dashboard/stats/',              DashboardStatsAPIView.as_view()),
+    path('admin/cache/',                  CacheDiagnosticsAPIView.as_view()),
 ]
     

@@ -16,7 +16,7 @@ from django.db.models import F, Count, Sum , Avg
 from .async_tasks import get_task_queue
 import logging
 from concurrent.futures import TimeoutError as FutureTimeoutError
-
+from core.cache_manager import get_dashboard_stats, get_cache_info, get_product_list
 
 from .capacity_controller import get_capacity_controller, ThreadPoolFullError
 
@@ -33,9 +33,10 @@ def register(request):
 
 class ProductListCreateAPIView(APIView):
     def get(self, request):
-        products = Product.objects.all()
-        serializer = ProductSerializer(products, many=True)
-        return Response(serializer.data)
+        data = get_product_list()      # ← من الكاش
+        if not data:
+            return Response({"error": "Not found"}, status=404)
+        return Response(data)
 
     def post(self, request):
         serializer = ProductSerializer(data=request.data)
@@ -371,3 +372,14 @@ class SalesReportStatsAPIView(APIView):
                 'total_items_sold': stats['total_items'] or 0,
             }
         }, status=status.HTTP_200_OK)
+class DashboardStatsAPIView(APIView):
+    def get(self, request):
+        data = get_dashboard_stats()
+        return Response(data)
+
+
+class CacheDiagnosticsAPIView(APIView):
+    def get(self, request):
+        return Response({
+            'cache_info': get_cache_info(),
+        })
