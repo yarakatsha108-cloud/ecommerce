@@ -1,10 +1,11 @@
 from rest_framework import serializers
-from .models import Product , OrderItem , Order ,  DailySalesReport
+from .models import Product, OrderItem, Order, DailySalesReport
 from django.contrib.auth.models import User
+
 
 class RegisterSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(required=False, allow_blank=True)
-    
+
     class Meta:
         model = User
         fields = ['username', 'email', 'password']
@@ -19,13 +20,12 @@ class RegisterSerializer(serializers.ModelSerializer):
         user.is_active = True
         user.save()
         return user
-    
-    
+
+
 class ProductSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
-        fields = '__all__'
-
+        fields = ['id', 'name', 'stock', 'price']
 
 
 class OrderItemSerializer(serializers.ModelSerializer):
@@ -42,44 +42,29 @@ class OrderSerializer(serializers.ModelSerializer):
     class Meta:
         model = Order
         fields = ['id', 'user', 'created_at', 'items']
-        
-        
+
+
 class CreateOrderSerializer(serializers.Serializer):
     product_id = serializers.IntegerField()
-    quantity = serializers.IntegerField()        
+    quantity = serializers.IntegerField(min_value=1)
+
 
 class DailySalesReportSerializer(serializers.ModelSerializer):
     processing_status_display = serializers.CharField(
-        source='get_status_display', 
+        source='get_status_display',
         read_only=True
     )
-    
+
     class Meta:
         model = DailySalesReport
         fields = [
-            'id',
-            'date',
-            'total_orders',
-            'completed_orders',
-            'cancelled_orders',
-            'pending_orders',
-            'total_revenue',
-            'average_order_value',
-            'total_items_sold',
-            'unique_customers',
-            'status',
-            'processing_status_display',
-            'chunks_processed',
-            'batch_size',
-            'processing_time_seconds',
-            'created_at',
-            'updated_at',
+            'id', 'date', 'total_orders', 'completed_orders',
+            'cancelled_orders', 'pending_orders', 'total_revenue',
+            'average_order_value', 'total_items_sold', 'unique_customers',
+            'status', 'processing_status_display', 'chunks_processed',
+            'batch_size', 'processing_time_seconds', 'created_at', 'updated_at',
         ]
         read_only_fields = [
-            'total_orders',
-            'total_revenue',
-            'total_items_sold',
-            'unique_customers',
-            'created_at',
-            'updated_at',
+            'total_orders', 'total_revenue', 'total_items_sold',
+            'unique_customers', 'created_at', 'updated_at',
         ]
