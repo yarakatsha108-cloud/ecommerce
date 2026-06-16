@@ -1,24 +1,31 @@
 from django.shortcuts import render
 from rest_framework.viewsets import ModelViewSet
 from .batch_processor import BatchProcessor
-from .models import DailySalesReport, Product , Order , OrderItem
-from .serializers import DailySalesReportSerializer, ProductSerializer , OrderSerializer , OrderItemSerializer , CreateOrderSerializer
+from .models import DailySalesReport, Product, Order, OrderItem
+from .serializers import (
+    DailySalesReportSerializer, ProductSerializer,
+    OrderSerializer, OrderItemSerializer, CreateOrderSerializer
+)
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from .serializers import RegisterSerializer
 from rest_framework.views import APIView
 from rest_framework import status
 from django.shortcuts import get_object_or_404
-from rest_framework.permissions import IsAuthenticated , IsAdminUser
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from datetime import datetime, timedelta
 from django.db import transaction
-from django.db.models import F, Count, Sum , Avg
+from django.db.models import F, Count, Sum, Avg
 from .async_tasks import get_task_queue
 import logging
 from concurrent.futures import TimeoutError as FutureTimeoutError
+<<<<<<< HEAD
 from core.cache_manager import get_dashboard_stats, get_cache_info, get_product_list
+=======
+>>>>>>> origin/main
 
 from .capacity_controller import get_capacity_controller, ThreadPoolFullError
+from .distributed_lock import acquire_product_lock, LockAcquisitionError
 
 logger = logging.getLogger(__name__)
 
@@ -96,43 +103,69 @@ class OrderListCreateAPIView(APIView):
         if quantity <= 0:
             return Response({"error": "Invalid quantity"}, status=400)
 
-        
         controller = get_capacity_controller()
 
-        
         def process_order():
-            with transaction.atomic():
-                
-                updated = Product.objects.filter(
-                    id=product_id,
-                    stock__gte=quantity
-                ).update(stock=F('stock') - quantity)
+           
+            with acquire_product_lock(product_id, timeout=10.0):
 
-            if not updated:
-                raise ValueError("Not enough stock")
+                # ── transaction.atomic: يضمن ACID على العمليات الثلاث ──
+                with transaction.atomic():
 
-            order = Order.objects.create(user=request.user)
-            OrderItem.objects.create(
-                order=order,
-                product_id=product_id,
-                quantity=quantity
-            )
-            return order.id
+                    # العملية 1: قراءة المنتج مع قفل DB (Isolation)
+                    try:
+                        product = Product.objects.select_for_update(
+                            nowait=False
+                        ).get(id=product_id)
+                    except Product.DoesNotExist:
+                        raise ValueError(f"Product #{product_id} not found")
+
+                    # Consistency check: فحص المخزون قبل أي تعديل
+                    if product.stock < quantity:
+                        raise ValueError(
+                            f"Insufficient stock — available: {product.stock}, requested: {quantity}"
+                        )
+
+                    # العملية 2: خصم المخزون (Atomicity)
+                    product.stock -= quantity
+                    product.save(update_fields=['stock'])
+
+                    # العملية 3: إنشاء الطلب (Atomicity)
+                    order = Order.objects.create(user=request.user)
+
+                    # العملية 4: إنشاء OrderItem (Atomicity)
+                    # لو فشلت هاي → rollback كل شي فوق معها
+                    OrderItem.objects.create(
+                        order=order,
+                        product_id=product_id,
+                        quantity=quantity
+                    )
+
+                    logger.info(
+                        f"[ACID] ✅ Transaction committed — "
+                        f"order #{order.id} | product #{product_id} | "
+                        f"stock: {product.stock + quantity} → {product.stock}"
+                    )
+
+                    return order.id
 
         try:
-            
             future = controller.submit(process_order, block=False)
-            
-            order_id = future.result(timeout=5)
+            order_id = future.result(timeout=15)
 
-            
             queue = get_task_queue()
             queue.enqueue('order_confirmation', order_id)
             queue.enqueue('send_notification', request.user.id,
-                            f"Order #{order_id} created successfully")
+                          f"Order #{order_id} created successfully")
 
             return Response({"message": "Order created", "order_id": order_id}, status=201)
 
+        except LockAcquisitionError as e:
+            logger.warning(f"[Locking] Lock failed for user {request.user.id}: {e}")
+            return Response(
+                {"error": "System is busy, please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
         except ThreadPoolFullError:
             logger.warning(f"Order creation rejected due to capacity: user {request.user.id}")
             return Response(
@@ -143,7 +176,7 @@ class OrderListCreateAPIView(APIView):
             logger.error(f"Order processing timeout for user {request.user.id}")
             return Response(
                 {"error": "Order processing timed out. Please try again."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
         except ValueError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -165,42 +198,49 @@ class OrderDetailAPIView(APIView):
 
     def put(self, request, id):
         order = get_object_or_404(Order, id=id, user=request.user)
-        item = order.orderitem_set.first()
-
-        with transaction.atomic():
-            item = order.orderitem_set.select_for_update().first()
-            product = item.product
 
         new_quantity = request.data.get('quantity')
         if not new_quantity:
             return Response({"error": "Quantity required"}, status=400)
 
         new_quantity = int(new_quantity)
-        product = item.product
-        diff = new_quantity - item.quantity
 
-        if diff > 0 and product.stock < diff:
-            return Response({"error": "Not enough stock"}, status=400)
+        # ✅ ACID: تحديث الكمية + المخزون معاً أو لا شي
+        with transaction.atomic():
+            item = order.orderitem_set.select_for_update().first()
+            if not item:
+                return Response({"error": "No items in order"}, status=400)
 
-        product.stock -= diff
-        product.save()
-        item.quantity = new_quantity
-        item.save()
+            product = Product.objects.select_for_update().get(id=item.product_id)
+            diff = new_quantity - item.quantity
+
+            if diff > 0 and product.stock < diff:
+                return Response({"error": "Not enough stock"}, status=400)
+
+            # العمليتان تنجحان معاً أو تفشلان معاً (Atomicity)
+            product.stock -= diff
+            product.save(update_fields=['stock'])
+
+            item.quantity = new_quantity
+            item.save()
 
         return Response({"message": "Order updated"})
 
     def delete(self, request, id):
         order = get_object_or_404(Order, id=id, user=request.user)
-        item = order.orderitem_set.first()
-        product = item.product
 
+        # ✅ ACID: حذف الطلب + إرجاع المخزون معاً أو لا شي
         with transaction.atomic():
             item = order.orderitem_set.select_for_update().first()
-            product = item.product
+            if not item:
+                order.delete()
+                return Response({"message": "Order deleted"}, status=204)
 
-        product.stock += item.quantity
-        product.save()
-        order.delete()
+            product = Product.objects.select_for_update().get(id=item.product_id)
+            product.stock += item.quantity
+            product.save(update_fields=['stock'])
+
+            order.delete()
 
         return Response({"message": "Order deleted"}, status=204)
 
@@ -209,18 +249,32 @@ class PayOrderAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, id):
-        order = get_object_or_404(Order, id=id, user=request.user)
-        if order.status != 'PENDING':
-            return Response({"error": "Order already processed"}, status=400)
+        
+        with transaction.atomic():
+            # select_for_update يمنع thread آخر من يدفع نفس الطلب بنفس الوقت
+            order = Order.objects.select_for_update().get(
+                id=id, user=request.user
+            ) if Order.objects.filter(id=id, user=request.user).exists() else None
 
-        order.status = 'PAID'
-        order.save()
+            if not order:
+                return Response({"error": "Order not found"}, status=404)
 
+            # Consistency check
+            if order.status != 'PENDING':
+                return Response({"error": "Order already processed"}, status=400)
+
+            # Atomicity: تغيير الحالة
+            order.status = 'PAID'
+            order.save(update_fields=['status'])
+
+            logger.info(f"[ACID] ✅ Payment committed — order #{order.id} → PAID")
+
+        # المهام الـ async خارج الـ transaction (لأنها لا تحتاج rollback)
         queue = get_task_queue()
         queue.enqueue('generate_invoice', order.id)
         queue.enqueue('payment_receipt', order.id)
         queue.enqueue('send_notification', request.user.id,
-                        f"Order #{order.id} paid successfully")
+                      f"Order #{order.id} paid successfully")
 
         return Response({"message": "Payment successful"})
 
@@ -229,16 +283,23 @@ class CompleteOrderAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, id):
-        order = get_object_or_404(Order, id=id, user=request.user)
-        if order.status != 'PAID':
-            return Response({"error": "Order not paid"}, status=400)
+        """
+        ✅ ACID Transaction على عملية الإكمال
+        """
+        with transaction.atomic():
+            order = get_object_or_404(Order, id=id, user=request.user)
 
-        order.status = 'COMPLETED'
-        order.save()
+            if order.status != 'PAID':
+                return Response({"error": "Order not paid"}, status=400)
+
+            order.status = 'COMPLETED'
+            order.save(update_fields=['status'])
+
+            logger.info(f"[ACID] ✅ Order #{order.id} → COMPLETED")
 
         queue = get_task_queue()
         queue.enqueue('send_notification', request.user.id,
-                        f"Order #{order.id} completed")
+                      f"Order #{order.id} completed")
 
         return Response({"message": "Order completed"})
 
@@ -247,28 +308,40 @@ class CancelOrderAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, id):
-        order = get_object_or_404(Order, id=id, user=request.user)
-        if order.status == 'CANCELLED':
-            return Response({"error": "Already cancelled"}, status=400)
+        
+        with transaction.atomic():
+            order = get_object_or_404(Order, id=id, user=request.user)
 
-        item = order.orderitem_set.first()
-        product = item.product
-        product.stock += item.quantity
-        product.save()
+            if order.status == 'CANCELLED':
+                return Response({"error": "Already cancelled"}, status=400)
 
-        order.status = 'CANCELLED'
-        order.save()
+            # العملية 1: إرجاع المخزون (Atomicity)
+            item = order.orderitem_set.select_for_update().first()
+            if item:
+                product = Product.objects.select_for_update().get(id=item.product_id)
+                product.stock += item.quantity
+                product.save(update_fields=['stock'])
+
+            # العملية 2: تغيير الحالة (Atomicity)
+            order.status = 'CANCELLED'
+            order.save(update_fields=['status'])
+
+            logger.info(
+                f"[ACID] ✅ Cancellation committed — order #{order.id} → CANCELLED | "
+                f"stock restored: +{item.quantity if item else 0}"
+            )
 
         queue = get_task_queue()
         queue.enqueue('cancellation_notice', order.id)
         queue.enqueue('send_notification', request.user.id,
-                        f"Order #{order.id} cancelled")
+                      f"Order #{order.id} cancelled")
 
         return Response({"message": "Order cancelled"})
-               
+
+
 class DailySalesReportListAPIView(APIView):
     permission_classes = [IsAdminUser]
-    
+
     def get(self, request):
         reports = DailySalesReport.objects.all()[:30]
         serializer = DailySalesReportSerializer(reports, many=True)
@@ -277,9 +350,8 @@ class DailySalesReportListAPIView(APIView):
 
 class DailySalesReportDetailAPIView(APIView):
     permission_classes = [IsAdminUser]
-    
-    def get(self, request, date):
 
+    def get(self, request, date):
         try:
             report = DailySalesReport.objects.get(date=date)
             serializer = DailySalesReportSerializer(report)
@@ -293,22 +365,22 @@ class DailySalesReportDetailAPIView(APIView):
 
 class ProcessDailySalesAPIView(APIView):
     permission_classes = [IsAdminUser]
-    
+
     def post(self, request):
         date_str = request.data.get('date')
         batch_size = request.data.get('batch_size', 100)
-        
+
         try:
             batch_size = int(batch_size)
         except (ValueError, TypeError):
             batch_size = 100
-        
+
         if not (10 <= batch_size <= 1000):
             return Response(
                 {"error": "batch_size must be between 10 and 1000"},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
         try:
             if date_str:
                 date = datetime.strptime(date_str, '%Y-%m-%d').date()
@@ -317,14 +389,14 @@ class ProcessDailySalesAPIView(APIView):
 
             processor = BatchProcessor(batch_size=batch_size)
             report = processor.process_daily_sales(date)
-            
+
             serializer = DailySalesReportSerializer(report)
             return Response({
                 'message': f'Sales processed successfully for {date}',
                 'report': serializer.data,
                 'stats': processor.get_processing_stats()
             }, status=status.HTTP_200_OK)
-        
+
         except ValueError as e:
             return Response(
                 {"error": f"Date format error: {str(e)}"},
@@ -335,13 +407,14 @@ class ProcessDailySalesAPIView(APIView):
                 {"error": f"Error processing sales: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-        
+
+
 class SalesReportStatsAPIView(APIView):
     permission_classes = [IsAdminUser]
-    
+
     def get(self, request):
         last_30_days = (datetime.now() - timedelta(days=30)).date()
-        
+
         stats = DailySalesReport.objects.filter(
             date__gte=last_30_days,
             status='COMPLETED'
@@ -353,14 +426,14 @@ class SalesReportStatsAPIView(APIView):
             avg_orders=Avg('total_orders'),
             count=Count('id')
         )
-        
+
         if not stats['count']:
             return Response({
                 'message': 'No completed reports found',
                 'total_reports': 0,
                 'stats': {}
             })
-        
+
         return Response({
             'period': f'Last 30 days (from {last_30_days} to now)',
             'total_reports': stats['count'],
