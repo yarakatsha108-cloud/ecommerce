@@ -1,18 +1,3 @@
-"""
-core/cache_manager.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Cache-Aside Pattern (Lazy Loading) فوق موديلاتك الحالية.
-
-الفكرة الأساسية:
-    1. دور في Redis أولاً
-    2. إذا موجود (HIT)  → ارجعه فوراً، بدون DB
-    3. إذا مش موجود (MISS) → اجلبه من DB
-    4. خزّنه في Redis مع TTL
-    5. ارجعه
-
-كل الـ views بتمر من هون — ما حدا بيكلم DB مباشرة للقراءة.
-"""
-
 import logging
 import time
 from typing import Optional
@@ -23,24 +8,12 @@ from django.core.cache import cache
 logger = logging.getLogger('core.cache_manager')
 
 
-#  TTL helper — يجيب الوقت من settings بدل ما يكون hardcoded
 
 def _ttl(name: str) -> int:
     return settings.CACHE_TTL.get(name, 60 * 10)
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  الدالة الأساسية — Cache-Aside Pattern
-#  كل الدوال التانية بتمر من هون
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def cache_aside(cache_key: str, fetch_fn, ttl: int):
-    """
-    Generic Cache-Aside implementation.
-
-    cache_key : المفتاح في Redis
-    fetch_fn  : دالة تجيب البيانات من DB لما يكون MISS
-    ttl       : وقت الصلاحية بالثواني
-    """
+   
 
     # ── Step 1: دور في Redis ─────────────────────────────────
     cached = cache.get(cache_key)
@@ -63,9 +36,7 @@ def cache_aside(cache_key: str, fetch_fn, ttl: int):
     return result
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  KEY BUILDERS — مفاتيح واضحة وموحّدة
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class CacheKeys:
     @staticmethod
     def product_list() -> str:
@@ -84,15 +55,9 @@ class CacheKeys:
         return "order:stats"
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  1. قائمة المنتجات
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def get_product_list() -> list:
-    """
-    بتجيب كل المنتجات.
-    TTL: 10 دقائق — القائمة بتتغير لما يُضاف أو يُحذف منتج،
-    والـ signal بيمسح الكاش فوراً عند أي تعديل.
-    """
+    
     from core.models import Product
 
     def _fetch():
@@ -108,14 +73,9 @@ def get_product_list() -> list:
     )
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  2. تفاصيل منتج واحد
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def get_product_detail(product_id: int) -> Optional[dict]:
-    """
-    TTL: 30 دقيقة — المنتج الواحد نادراً يتغير.
-    لما يتغير، الـ signal بيمسح مفتاحه تحديداً.
-    """
+    
     from core.models import Product
 
     def _fetch():
@@ -137,15 +97,9 @@ def get_product_detail(product_id: int) -> Optional[dict]:
     )
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  3. إحصائيات الداشبورد
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def get_dashboard_stats() -> dict:
-    """
-    ليش 5 دقائق بس؟
-    لأن الداشبورد بيحتاج يكون شبه حديث — المدير بده يشوف
-    أرقام قريبة من الواقع، مش أرقام من ساعة.
-    """
+    
     from core.models import Product, Order
     from django.db.models import Sum, Count
 
@@ -182,14 +136,11 @@ def get_dashboard_stats() -> dict:
     )
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 #  4. إحصائيات الطلبات (للـ monitoring)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 def get_order_stats() -> dict:
-    """
-    مشابه للداشبورد بس مخصص لصفحة الـ monitoring.
-    TTL: 5 دقائق.
-    """
+    
     from core.models import Order
     from django.db.models import Count
     from django.utils import timezone
@@ -212,41 +163,26 @@ def get_order_stats() -> dict:
     )
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  INVALIDATION FUNCTIONS — بتنادي عليها الـ signals
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def invalidate_product(product_id: int) -> None:
-    """
-    لما منتج يتغير، امسح:
-    - مفتاحه هو (product:{id})
-    - قائمة كل المنتجات (product:list)
-    ليش القائمة كمان؟ لأنها بتحتوي على بياناته.
-    """
+    
     keys = [
         CacheKeys.product_detail(product_id),
         CacheKeys.product_list(),
     ]
     cache.delete_many(keys)
-    logger.debug("🗑  Invalidated: %s", keys)
+    logger.debug("  Invalidated: %s", keys)
 
 
 def invalidate_dashboard() -> None:
-    """لما طلب يتغير → إحصائيات الداشبورد بتتغير."""
     cache.delete(CacheKeys.dashboard_stats())
     cache.delete(CacheKeys.order_stats())
-    logger.debug("🗑  Invalidated dashboard + order stats")
+    logger.debug("  Invalidated dashboard + order stats")
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  DIAGNOSTICS — لصفحة الـ monitoring
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def get_cache_info() -> dict:
-    """
-    بتجيب معلومات Redis Server:
-    - كم HIT وكم MISS
-    - نسبة الـ hit rate
-    - كمية الذاكرة المستخدمة
-    """
+   
     try:
         from django_redis import get_redis_connection
         info  = get_redis_connection("default").info()
