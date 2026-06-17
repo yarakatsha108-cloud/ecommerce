@@ -100,41 +100,23 @@ def get_product_detail(product_id: int) -> Optional[dict]:
 
 #  3. إحصائيات الداشبورد
 def get_dashboard_stats() -> dict:
-    
     from core.models import Product, Order
-    from django.db.models import Sum, Count
+    from django.db.models import Count, Q   # ← أضف Q هون
 
     def _fetch():
         product_stats = Product.objects.aggregate(
             total_products=Count('id'),
-            low_stock=Count('id', filter=__import__(
-                'django.db.models', fromlist=['Q']
-            ).Q(stock__lte=10))
+            low_stock=Count('id', filter=Q(stock__lte=10))   # ← نظيف
         )
-
         order_stats = Order.objects.aggregate(
             total_orders=Count('id'),
-            pending=Count('id', filter=__import__(
-                'django.db.models', fromlist=['Q']
-            ).Q(status='PENDING')),
-            paid=Count('id', filter=__import__(
-                'django.db.models', fromlist=['Q']
-            ).Q(status='PAID')),
-            completed=Count('id', filter=__import__(
-                'django.db.models', fromlist=['Q']
-            ).Q(status='COMPLETED')),
+            pending=Count('id',   filter=Q(status='PENDING')),
+            paid=Count('id',      filter=Q(status='PAID')),
+            completed=Count('id', filter=Q(status='COMPLETED')),
         )
+        return {'products': product_stats, 'orders': order_stats}
 
-        return {
-            'products': product_stats,
-            'orders':   order_stats,
-        }
-
-    return cache_aside(
-        CacheKeys.dashboard_stats(),
-        _fetch,
-        _ttl('DASHBOARD_STATS')
-    )
+    return cache_aside(CacheKeys.dashboard_stats(), _fetch, _ttl('DASHBOARD_STATS'))
 
 
 
@@ -177,22 +159,6 @@ def invalidate_product(product_id: int) -> None:
 
     logger.debug("Invalidated: %s", keys)
 
-    keys = [
-        CacheKeys.product_detail(product_id),
-        CacheKeys.product_list(),
-        CacheKeys.dashboard_stats(),
-    ]
-
-    cache.delete_many(keys)
-
-    logger.debug("Invalidated: %s", keys)
-    
-    keys = [
-        CacheKeys.product_detail(product_id),
-        CacheKeys.product_list(),
-    ]
-    cache.delete_many(keys)
-    logger.debug("  Invalidated: %s", keys)
 
 
 def invalidate_dashboard() -> None:
