@@ -8,21 +8,22 @@ from django.core.cache import cache
 logger = logging.getLogger('core.cache_manager')
 
 
-
+# THe maximum allowed caching time for each cache key, in seconds "Time TO Live"
 def _ttl(name: str) -> int:
     return settings.CACHE_TTL.get(name, 60 * 10)
 
+# Cache Aside Pattern
 def cache_aside(cache_key: str, fetch_fn, ttl: int):
    
 
-    # ── Step 1: دور في Redis ─────────────────────────────────
+    # ── Step 1: دور في Redis على النتيجة 
     cached = cache.get(cache_key)
     if cached is not None:
-        logger.debug("✅ CACHE HIT  | key='%s'", cache_key)
+        logger.debug(" CACHE HIT  | key='%s'", cache_key)
         return cached
 
     # ── Step 2: MISS → اجلب من DB ───────────────────────────
-    logger.debug("❌ CACHE MISS | key='%s' → going to DB", cache_key)
+    logger.debug(" CACHE MISS | key='%s' → going to DB", cache_key)
     t0 = time.perf_counter()
     result = fetch_fn()
     ms = (time.perf_counter() - t0) * 1000
@@ -165,6 +166,26 @@ def get_order_stats() -> dict:
 
 #  INVALIDATION FUNCTIONS — بتنادي عليها الـ signals
 def invalidate_product(product_id: int) -> None:
+
+    keys = [
+        CacheKeys.product_detail(product_id),
+        CacheKeys.product_list(),
+        CacheKeys.dashboard_stats(),
+    ]
+
+    cache.delete_many(keys)
+
+    logger.debug("Invalidated: %s", keys)
+
+    keys = [
+        CacheKeys.product_detail(product_id),
+        CacheKeys.product_list(),
+        CacheKeys.dashboard_stats(),
+    ]
+
+    cache.delete_many(keys)
+
+    logger.debug("Invalidated: %s", keys)
     
     keys = [
         CacheKeys.product_detail(product_id),
@@ -199,3 +220,35 @@ def get_cache_info() -> dict:
         }
     except Exception as exc:
         return {'status': 'error', 'detail': str(exc)}
+    
+def get_sales_stats():
+
+    from core.models import DailySalesReport
+    from django.db.models import Sum, Avg, Count
+    from datetime import datetime, timedelta
+
+    def _fetch():
+
+        last_30_days = (
+            datetime.now() - timedelta(days=30)
+        ).date()
+
+        stats = DailySalesReport.objects.filter(
+            date__gte=last_30_days,
+            status='COMPLETED'
+        ).aggregate(
+            total_revenue=Sum('total_revenue'),
+            total_orders=Sum('total_orders'),
+            total_items=Sum('total_items_sold'),
+            avg_revenue=Avg('total_revenue'),
+            avg_orders=Avg('total_orders'),
+            count=Count('id')
+        )
+
+        return stats
+
+    return cache_aside(
+        "sales:stats",
+        _fetch,
+        300
+    )

@@ -151,24 +151,24 @@ CACHES = {
         "LOCATION": "redis://127.0.0.1:6379/1",  # DB 1 للـ app cache
         "OPTIONS": {
             "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            "SOCKET_CONNECT_TIMEOUT": 5,
+            "SOCKET_TIMEOUT": 5,
             # إذا انهار Redis → النظام يكمل من DB مباشرة بدون crash
-            "IGNORE_EXCEPTIONS": False,
+            "IGNORE_EXCEPTIONS": True,
             # connection pool: 50 اتصال لكل worker — يتحمل 100+ مستخدم متزامن
             "CONNECTION_POOL_KWARGS": {
                 "max_connections": 50,
                 "retry_on_timeout": True,
-            },
-            "SOCKET_CONNECT_TIMEOUT": 5,
-            "SOCKET_TIMEOUT": 5,
+            },  
         },
         "KEY_PREFIX": "ecom",   # يمنع التعارض لو شاركت Redis مع مشروع ثاني
         "VERSION": 1,
+        
     }
 }
- 
-# ─────────────────────────────────────────────────────────────
+
 #  TTL لكل domain — مركّزة هنا بدل ما تكون مبعثرة في الكود
-# ─────────────────────────────────────────────────────────────
+
 CACHE_TTL = {
     'PRODUCT_LIST':    60 * 10,   # 10 دقائق — القائمة تتغير أقل من التفاصيل
     'PRODUCT_DETAIL':  60 * 30,   # 30 دقيقة — المنتج الواحد نادراً يتغير
@@ -176,9 +176,9 @@ CACHE_TTL = {
     'ORDER_STATS':     60 * 5,    # 5 دقائق
 }
  
-# ─────────────────────────────────────────────────────────────
+
 #  LOGGING — يظهر CACHE HIT / MISS في الـ console
-# ─────────────────────────────────────────────────────────────
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
