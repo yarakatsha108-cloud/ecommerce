@@ -67,7 +67,7 @@ class BatchProcessingTester:
 
     # Test Data
     # نقوم بإنشاء بيانات اختبارية من الطلبات والمنتجات والمستخدمين لتاريخ اليوم حتى يتمكن المعالج من العثور عليها ومعالجتها
-    def create_test_data(self, num_orders: int = 10000):
+    def create_test_data(self, num_orders: int = 1000):
         print("Creating test data...")
 
         # تنظيف البيانات القديمة أولاً

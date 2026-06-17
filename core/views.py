@@ -19,6 +19,15 @@ from django.db.models import F, Count, Sum, Avg
 from .async_tasks import get_task_queue
 import logging
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from core.cache_manager import (
+    get_dashboard_stats,
+    get_cache_info,
+    get_product_list,
+    get_product_detail,
+    get_cache_info,
+    get_order_stats,
+    get_sales_stats,
+)
 
 from .capacity_controller import get_capacity_controller, ThreadPoolFullError
 from .distributed_lock import acquire_product_lock, LockAcquisitionError
@@ -36,9 +45,10 @@ def register(request):
 
 class ProductListCreateAPIView(APIView):
     def get(self, request):
-        products = Product.objects.all()
-        serializer = ProductSerializer(products, many=True)
-        return Response(serializer.data)
+        data = get_product_list()      
+        if not data:
+            return Response({"error": "Not found"}, status=404)
+        return Response(data)
 
     def post(self, request):
         serializer = ProductSerializer(data=request.data)
@@ -56,11 +66,12 @@ class ProductDetailAPIView(APIView):
             return None
 
     def get(self, request, id):
-        product = self.get_object(id)
+        product = get_product_detail(id)
+
         if not product:
             return Response({"error": "Not found"}, status=404)
-        serializer = ProductSerializer(product)
-        return Response(serializer.data)
+
+        return Response(product)
 
     def put(self, request, id):
         product = self.get_object(id)
@@ -408,19 +419,10 @@ class SalesReportStatsAPIView(APIView):
     permission_classes = [IsAdminUser]
 
     def get(self, request):
-        last_30_days = (datetime.now() - timedelta(days=30)).date()
 
-        stats = DailySalesReport.objects.filter(
-            date__gte=last_30_days,
-            status='COMPLETED'
-        ).aggregate(
-            total_revenue=Sum('total_revenue'),
-            total_orders=Sum('total_orders'),
-            total_items=Sum('total_items_sold'),
-            avg_revenue=Avg('total_revenue'),
-            avg_orders=Avg('total_orders'),
-            count=Count('id')
-        )
+        from core.cache_manager import get_sales_stats
+
+        stats = get_sales_stats()
 
         if not stats['count']:
             return Response({
@@ -430,13 +432,24 @@ class SalesReportStatsAPIView(APIView):
             })
 
         return Response({
-            'period': f'Last 30 days (from {last_30_days} to now)',
             'total_reports': stats['count'],
-            'stats': {
-                'total_revenue': float(stats['total_revenue'] or 0),
-                'average_daily_revenue': float(stats['avg_revenue'] or 0),
-                'total_orders': stats['total_orders'] or 0,
-                'average_orders_per_day': float(stats['avg_orders'] or 0),
-                'total_items_sold': stats['total_items'] or 0,
-            }
-        }, status=status.HTTP_200_OK)
+            'stats': stats
+        })
+
+
+class DashboardStatsAPIView(APIView):
+    def get(self, request):
+        data = get_dashboard_stats()
+        return Response(data)
+
+class OrderStatsAPIView(APIView):
+
+    def get(self, request):
+        return Response(get_order_stats())
+
+class CacheDiagnosticsAPIView(APIView):
+    def get(self, request):
+        return Response({
+            'cache_info': get_cache_info(),
+        })
+    

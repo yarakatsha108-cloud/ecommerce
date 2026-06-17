@@ -1,7 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import User
 
-
 class Product(models.Model):
     name = models.CharField(max_length=225)
     stock = models.IntegerField()
@@ -37,8 +36,10 @@ class DailySalesReport(models.Model):
     pending_orders = models.IntegerField(default=0)
     total_revenue = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     average_order_value = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
     total_items_sold = models.IntegerField(default=0)
     unique_customers = models.IntegerField(default=0)
+
     status = models.CharField(
         max_length=20,
         choices=[
@@ -49,6 +50,7 @@ class DailySalesReport(models.Model):
         ],
         default='PENDING'
     )
+
     chunks_processed = models.IntegerField(default=0)
     batch_size = models.IntegerField(default=100)
     processing_time_seconds = models.FloatField(default=0)

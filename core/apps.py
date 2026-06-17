@@ -28,3 +28,4 @@ class CoreConfig(AppConfig):
 
         queue.start_workers()
         logger.info("Async task queue initialized with handlers")
+        import core.signals
