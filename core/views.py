@@ -45,7 +45,7 @@ def register(request):
 
 class ProductListCreateAPIView(APIView):
     def get(self, request):
-        data = get_product_list()      # ← من الكاش
+        data = get_product_list()      
         if not data:
             return Response({"error": "Not found"}, status=404)
         return Response(data)
