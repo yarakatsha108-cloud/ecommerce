@@ -70,6 +70,7 @@ MIDDLEWARE = [
     'core.middleware.ThreadPoolControlMiddleware',
     'core.middleware.ThrottlingMiddleware',
     'core.middleware.RequestLoggingMiddleware',
+    # 'core.benchmarking.BenchmarkMiddleware',  # ← فك التعليق لتفعيل قياس زمن الاستجابة
 ]
 
 ROOT_URLCONF = 'ecommerce.urls'

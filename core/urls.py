@@ -14,6 +14,15 @@ from .monitoring_views import (
     reset_capacity_stats_view,
     async_queue_status_view,
 )
+from .benchmark_views import (
+    benchmark_stats,
+    benchmark_report,
+    benchmark_reset,
+    benchmark_snapshot,
+    benchmark_snapshots_list,
+    benchmark_compare,
+    benchmark_bottleneck,
+)
 
 urlpatterns = [
     path('products/', ProductListCreateAPIView.as_view()),
@@ -35,4 +44,12 @@ urlpatterns = [
     path('admin/health/', system_health_view),
     path('admin/capacity/reset/', reset_capacity_stats_view),
     path('admin/async-queue/', async_queue_status_view),
+
+    path('benchmark/', benchmark_stats),
+    path('benchmark/report/', benchmark_report),
+    path('benchmark/reset/', benchmark_reset),
+    path('benchmark/snapshot/', benchmark_snapshot),
+    path('benchmark/snapshots/', benchmark_snapshots_list),
+    path('benchmark/compare/', benchmark_compare),
+    path('benchmark/bottleneck/', benchmark_bottleneck),
 ]
