@@ -18,6 +18,7 @@ from django.db import transaction
 from django.db.models import F, Count, Sum, Avg
 from .async_tasks import get_task_queue
 import logging
+import time as _time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from core.cache_manager import (
     get_dashboard_stats,
@@ -30,6 +31,7 @@ from core.cache_manager import (
 
 from .capacity_controller import get_capacity_controller, ThreadPoolFullError
 from .distributed_lock import acquire_product_lock, LockAcquisitionError
+from .benchmarking import benchmark
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ def register(request):
 
 
 class ProductListCreateAPIView(APIView):
+    @benchmark('ProductListCreateAPIView.get')
     def get(self, request):
         data = get_product_list()      
         if not data:
@@ -98,6 +101,7 @@ class OrderListCreateAPIView(APIView):
         serializer = OrderSerializer(orders, many=True)
         return Response(serializer.data)
 
+    @benchmark('OrderListCreateAPIView.post')
     def post(self, request):
         serializer = CreateOrderSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -111,48 +115,45 @@ class OrderListCreateAPIView(APIView):
         controller = get_capacity_controller()
 
         def process_order():
-           
-            with acquire_product_lock(product_id, timeout=10.0):
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    product = Product.objects.get(id=product_id)
+                except Product.DoesNotExist:
+                    raise ValueError(f"Product #{product_id} not found")
 
-                # ── transaction.atomic: يضمن ACID على العمليات الثلاث ──
-                with transaction.atomic():
+                if product.stock < quantity:
+                    raise ValueError(
+                        f"Insufficient stock — available: {product.stock}, requested: {quantity}"
+                    )
 
-                    # العملية 1: قراءة المنتج مع قفل DB (Isolation)
-                    try:
-                        product = Product.objects.select_for_update(
-                            nowait=False
-                        ).get(id=product_id)
-                    except Product.DoesNotExist:
-                        raise ValueError(f"Product #{product_id} not found")
+                updated = Product.objects.filter(
+                    id=product_id,
+                    version=product.version,
+                    stock__gte=quantity
+                ).update(
+                    stock=F('stock') - quantity,
+                    version=F('version') + 1
+                )
 
-                    # Consistency check: فحص المخزون قبل أي تعديل
-                    if product.stock < quantity:
-                        raise ValueError(
-                            f"Insufficient stock — available: {product.stock}, requested: {quantity}"
+                if updated:
+                    with transaction.atomic():
+                        order = Order.objects.create(user=request.user)
+                        OrderItem.objects.create(
+                            order=order,
+                            product_id=product_id,
+                            quantity=quantity
                         )
 
-                    # العملية 2: خصم المخزون (Atomicity)
-                    product.stock -= quantity
-                    product.save(update_fields=['stock'])
-
-                    # العملية 3: إنشاء الطلب (Atomicity)
-                    order = Order.objects.create(user=request.user)
-
-                    # العملية 4: إنشاء OrderItem (Atomicity)
-                    # لو فشلت هاي → rollback كل شي فوق معها
-                    OrderItem.objects.create(
-                        order=order,
-                        product_id=product_id,
-                        quantity=quantity
-                    )
-
                     logger.info(
-                        f"[ACID] ✅ Transaction committed — "
-                        f"order #{order.id} | product #{product_id} | "
-                        f"stock: {product.stock + quantity} → {product.stock}"
+                        f"[OptimisticLock] order #{order.id} | product #{product_id} | "
+                        f"version {product.version} -> {product.version + 1}"
                     )
-
                     return order.id
+
+                _time.sleep(0.05)
+
+            raise ValueError("System busy due to concurrent updates, please try again")
 
         try:
             future = controller.submit(process_order, block=False)
@@ -165,12 +166,6 @@ class OrderListCreateAPIView(APIView):
 
             return Response({"message": "Order created", "order_id": order_id}, status=201)
 
-        except LockAcquisitionError as e:
-            logger.warning(f"[Locking] Lock failed for user {request.user.id}: {e}")
-            return Response(
-                {"error": "System is busy, please try again later."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE
-            )
         except ThreadPoolFullError:
             logger.warning(f"Order creation rejected due to capacity: user {request.user.id}")
             return Response(
@@ -201,6 +196,7 @@ class OrderDetailAPIView(APIView):
         serializer = OrderSerializer(order)
         return Response(serializer.data)
 
+    @benchmark('OrderDetailAPIView.put')
     def put(self, request, id):
         order = get_object_or_404(Order, id=id, user=request.user)
 
@@ -231,6 +227,7 @@ class OrderDetailAPIView(APIView):
 
         return Response({"message": "Order updated"})
 
+    @benchmark('OrderDetailAPIView.delete')
     def delete(self, request, id):
         order = get_object_or_404(Order, id=id, user=request.user)
 
@@ -253,6 +250,7 @@ class OrderDetailAPIView(APIView):
 class PayOrderAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @benchmark('PayOrderAPIView.post')
     def post(self, request, id):
         
         with transaction.atomic():
@@ -287,6 +285,7 @@ class PayOrderAPIView(APIView):
 class CompleteOrderAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @benchmark('CompleteOrderAPIView.post')
     def post(self, request, id):
         """
         ✅ ACID Transaction على عملية الإكمال
@@ -312,6 +311,7 @@ class CompleteOrderAPIView(APIView):
 class CancelOrderAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @benchmark('CancelOrderAPIView.post')
     def post(self, request, id):
         
         with transaction.atomic():

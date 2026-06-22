@@ -5,6 +5,7 @@ class Product(models.Model):
     name = models.CharField(max_length=225)
     stock = models.IntegerField()
     price = models.DecimalField(max_digits=10, decimal_places=2)
+    version = models.IntegerField(default=1)
 
     def __str__(self):
         return f"{self.name} (stock={self.stock})"

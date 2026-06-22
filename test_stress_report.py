@@ -76,20 +76,29 @@ def setup_fixtures(num_products=5, stock_per_product=99999):
 # ── Order Simulation ───
 
 def simulate_order(user, product_id, quantity, controller, results, lock):
-    """Simulates a single order through the capacity controller (same logic as views.py)."""
+    """Simulates a single order with Optimistic Locking (version + F())."""
     start = time.time()
 
     def process_order():
-        with transaction.atomic():
+        max_retries = 5
+        for attempt in range(max_retries):
+            product = Product.objects.get(id=product_id)
+            if product.stock < quantity:
+                raise ValueError("Not enough stock")
             updated = Product.objects.filter(
                 id=product_id,
+                version=product.version,
                 stock__gte=quantity
-            ).update(stock=F('stock') - quantity)
-        if not updated:
-            raise ValueError("Not enough stock")
-        order = Order.objects.create(user=user)
-        OrderItem.objects.create(order=order, product_id=product_id, quantity=quantity)
-        return order.id
+            ).update(
+                stock=F('stock') - quantity,
+                version=F('version') + 1
+            )
+            if updated:
+                order = Order.objects.create(user=user)
+                OrderItem.objects.create(order=order, product_id=product_id, quantity=quantity)
+                return order.id
+            time.sleep(0.05)
+        raise ValueError("Update conflict, please retry")
 
     outcome = "unknown"
     try:
