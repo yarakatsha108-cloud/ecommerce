@@ -24,7 +24,6 @@ from core.cache_manager import (
     get_cache_info,
     get_product_list,
     get_product_detail,
-    get_cache_info,
     get_order_stats,
     get_sales_stats,
 )

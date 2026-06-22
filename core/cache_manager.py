@@ -11,7 +11,7 @@ logger = logging.getLogger('core.cache_manager')
 # THe maximum allowed caching time for each cache key, in seconds "Time TO Live"
 def _ttl(name: str) -> int:
     return settings.CACHE_TTL.get(name, 60 * 10)
-
+    
 # Cache Aside Pattern
 def cache_aside(cache_key: str, fetch_fn, ttl: int):
    

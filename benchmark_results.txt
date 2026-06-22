@@ -1,0 +1,36 @@
+
+=====================================
+100 USERS CONCURRENCY TEST REPORT
+=====================================
+
+Total Users: 100
+
+Successful Requests: 0
+Failed Requests: 100
+
+Success Rate: 0.00 %
+Failure Rate: 100.00 %
+
+Average Response Time: 25308.36 ms
+Median Response Time: 25306.11 ms
+95th Percentile: 29301.65 ms
+
+Min Response Time: 20883.48 ms
+Max Response Time: 29751.81 ms
+
+Total Test Duration: 34.83 sec
+
+Throughput: 2.87 req/sec
+
+=====================================
+ERROR ANALYSIS
+=====================================
+
+Unknown: 23
+Timeout: 77
+
+=====================================
+BOTTLENECK ANALYSIS
+=====================================
+- Capacity Controller is rejecting requests.
+- System throughput is lower than expected.
