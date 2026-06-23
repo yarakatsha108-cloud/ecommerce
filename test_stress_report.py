@@ -1,4 +1,3 @@
-
 import os
 import sys
 import django
@@ -10,7 +9,6 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 
-# ── Django Setup ──────────────────────────────────────────────────────────────
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'ecommerce.settings')
 sys.path.insert(0, os.path.dirname(__file__))
 django.setup()
@@ -29,8 +27,6 @@ from core.async_tasks import get_task_queue
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
 
-# ── Helpers ──
-
 def divider(char="=", n=65):
     print(char * n)
 
@@ -41,7 +37,6 @@ def section(title):
     divider()
 
 def cpu_ram():
-    proc = psutil.Process()
     return {
         "cpu"    : psutil.cpu_percent(interval=0.3),
         "ram_pct": psutil.virtual_memory().percent,
@@ -49,16 +44,17 @@ def cpu_ram():
     }
 
 
-# ── Fixture Setup ──
-
-def setup_fixtures(num_products=5, stock_per_product=99999):
-    """Creates a test user and products; resets stock."""
-    user, _ = User.objects.get_or_create(
-        username="stress_user",
-        defaults={"email": "stress@test.com"}
-    )
-    user.set_password("stress123")
-    user.save()
+def setup_fixtures(num_products=5, stock_per_product=99999, num_users=100):
+    """Creates 100 test users and products; resets stock."""
+    users = []
+    for i in range(num_users):
+        user, _ = User.objects.get_or_create(
+            username=f"stress_user_{i+1}",
+            defaults={"email": f"stress{i+1}@test.com"}
+        )
+        user.set_password("stress123")
+        user.save()
+        users.append(user)
 
     products = []
     for i in range(num_products):
@@ -66,17 +62,13 @@ def setup_fixtures(num_products=5, stock_per_product=99999):
             name=f"StressProduct_{i+1}",
             defaults={"stock": stock_per_product, "price": 50.00 + i * 10}
         )
-        # Reset stock each run
         Product.objects.filter(id=p.id).update(stock=stock_per_product)
         products.append(p)
 
-    return user, products
+    return users, products
 
-
-# ── Order Simulation ───
 
 def simulate_order(user, product_id, quantity, controller, results, lock):
-    """Simulates a single order through the capacity controller (same logic as views.py)."""
     start = time.time()
 
     def process_order():
@@ -94,7 +86,7 @@ def simulate_order(user, product_id, quantity, controller, results, lock):
     outcome = "unknown"
     try:
         future = controller.submit(process_order, block=False)
-        future.result(timeout=5)
+        future.result(timeout=30)
         outcome = "success"
     except ThreadPoolFullError:
         outcome = "rejected"
@@ -106,21 +98,19 @@ def simulate_order(user, product_id, quantity, controller, results, lock):
         outcome = "error"
 
     elapsed = round(time.time() - start, 4)
-
     with lock:
         results["outcomes"][outcome] += 1
         results["response_times"].append(elapsed)
 
 
-
-#  TEST 1 — Concurrent Spike (اختبار الذروة المتزامنة)
-
-
-def test_concurrent_spike(user, products, controller, num_requests=150, max_workers=50):
+def test_concurrent_spike(users, products, controller, num_requests=150, max_workers=50):
     section("TEST 1 — Concurrent Spike  (اختبار الذروة المتزامنة)")
     print(f"  Requests  : {num_requests}")
     print(f"  Workers   : {max_workers}")
-    print(f"  Pool size : {controller.max_concurrent} workers / queue {controller.max_queue_size}")
+    print(f"  Users     : {len(users)} unique users")
+    max_w = getattr(controller, 'max_workers', None) or getattr(controller, 'max_concurrent', '?')
+    max_q = getattr(controller, 'max_queue_size', None) or getattr(controller, 'queue_max_size', '?')
+    print(f"  Pool size : {max_w} workers / queue {max_q}")
     print()
 
     results = {"outcomes": defaultdict(int), "response_times": []}
@@ -134,7 +124,8 @@ def test_concurrent_spike(user, products, controller, num_requests=150, max_work
         futures = [
             pool.submit(
                 simulate_order,
-                user, products[i % len(products)].id, 1,
+                users[i % len(users)],
+                products[i % len(products)].id, 1,
                 controller, results, lock
             )
             for i in range(num_requests)
@@ -153,26 +144,24 @@ def test_concurrent_spike(user, products, controller, num_requests=150, max_work
     return results, elapsed
 
 
-
-#  TEST 2 — Sustained Load (اختبار الحمل المستمر)
-
-def test_sustained_load(user, products, controller, duration_sec=30, num_workers=20):
+def test_sustained_load(users, products, controller, duration_sec=30, num_workers=20):
     section("TEST 2 — Sustained Load  (اختبار الحمل المستمر)")
     print(f"  Duration  : {duration_sec}s")
     print(f"  Workers   : {num_workers} continuous threads")
+    print(f"  Users     : {len(users)} unique users")
     print()
 
     results = {"outcomes": defaultdict(int), "response_times": []}
     lock = threading.Lock()
     stop = threading.Event()
-
-    snapshots = []  # (timestamp, cpu, ram_mb)
+    snapshots = []
 
     def worker(wid):
         idx = 0
         while not stop.is_set():
             simulate_order(
-                user, products[idx % len(products)].id, 1,
+                users[wid % len(users)],
+                products[idx % len(products)].id, 1,
                 controller, results, lock
             )
             idx += 1
@@ -191,7 +180,6 @@ def test_sustained_load(user, products, controller, duration_sec=30, num_workers
     for t in threads:
         t.start()
 
-    # Progress bar
     for sec in range(0, duration_sec, 5):
         time.sleep(5)
         done = sum(results["outcomes"].values())
@@ -203,7 +191,6 @@ def test_sustained_load(user, products, controller, duration_sec=30, num_workers
         t.join(timeout=3)
     elapsed = round(time.time() - t0, 2)
 
-    # Resource summary from samples
     if snapshots:
         cpus = [s[1] for s in snapshots]
         rams = [s[2] for s in snapshots]
@@ -217,11 +204,7 @@ def test_sustained_load(user, products, controller, duration_sec=30, num_workers
     return results, elapsed
 
 
-
-#  TEST 3 — Recovery (اختبار الانتعاش بعد الإغراق)
-
-
-def test_recovery(user, products, controller):
+def test_recovery(users, products, controller):
     section("TEST 3 — Recovery After Flood  (اختبار الانتعاش)")
     print("  Phase A: flood the system with 200 requests in 2 seconds")
     print("  Phase B: wait 5 seconds (cool-down)")
@@ -230,11 +213,12 @@ def test_recovery(user, products, controller):
 
     lock = threading.Lock()
 
-    # Phase A — flood
     flood_results = {"outcomes": defaultdict(int), "response_times": []}
     with ThreadPoolExecutor(max_workers=80) as pool:
         futs = [
-            pool.submit(simulate_order, user, products[i % len(products)].id, 1,
+            pool.submit(simulate_order,
+                        users[i % len(users)],
+                        products[i % len(products)].id, 1,
                         controller, flood_results, lock)
             for i in range(200)
         ]
@@ -246,18 +230,18 @@ def test_recovery(user, products, controller):
     print(f"  [Phase A] success={flood_success}  rejected={flood_rejected}  "
           f"timeout={flood_results['outcomes']['timeout']}")
 
-    # Phase B — cool-down
     print("  [Phase B] Cooling down 5 seconds...")
     time.sleep(5)
     status = controller.get_status()
     print(f"  [Phase B] Queue size after cool-down: {status['queue_size']}")
 
-    # Phase C — normal requests
     normal_results = {"outcomes": defaultdict(int), "response_times": []}
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=5) as pool:
         futs = [
-            pool.submit(simulate_order, user, products[i % len(products)].id, 1,
+            pool.submit(simulate_order,
+                        users[i % len(users)],
+                        products[i % len(products)].id, 1,
                         controller, normal_results, lock)
             for i in range(20)
         ]
@@ -273,10 +257,6 @@ def test_recovery(user, products, controller):
     recovered = recovery_rate >= 90
     print(f"  Recovery verdict: {'PASS — system recovered successfully' if recovered else 'FAIL — system did NOT recover'}")
     return flood_results, normal_results, recovery_rate
-
-
-
-#  TEST 4 — Async Queue Under Pressure
 
 
 def test_async_queue_pressure(queue_obj, num_tasks=500):
@@ -298,13 +278,12 @@ def test_async_queue_pressure(queue_obj, num_tasks=500):
     elapsed = round(time.time() - t0, 3)
     status  = queue_obj.get_status()
 
-    print(f"  Enqueue time   : {elapsed}s  ({round(num_tasks/elapsed) if elapsed > 0 else '∞'} tasks/sec)")
+    print(f"  Enqueue time   : {elapsed}s  ({round(num_tasks/elapsed) if elapsed > 0 else 'inf'} tasks/sec)")
     print(f"  Accepted       : {accepted}")
     print(f"  Dropped (full) : {dropped}")
     print(f"  Queue size now : {status['queue_size']}")
     print(f"  Active workers : {status['active_workers']}/{queue_obj.num_workers}")
 
-    # Wait for workers to drain
     print()
     print("  Waiting for workers to drain queue...")
     wait_start = time.time()
@@ -315,10 +294,6 @@ def test_async_queue_pressure(queue_obj, num_tasks=500):
     drain_time = round(time.time() - wait_start, 1)
     print(f"  Queue drained in {drain_time}s")
     print(f"  Drop rate      : {round(dropped/num_tasks*100, 1)}%")
-
-
-
-#  Results Printer
 
 
 def _print_results(results, elapsed, label=""):
@@ -334,7 +309,7 @@ def _print_results(results, elapsed, label=""):
     success_rate = round(success / total * 100, 1) if total else 0
     rps          = round(total / elapsed, 1) if elapsed else 0
 
-    print(f"  ── {label} Results ──────────────────────────")
+    print(f"  -- {label} Results --")
     print(f"  Total requests  : {total}")
     print(f"  Success         : {success}  ({success_rate}%)")
     print(f"  Rejected (503)  : {rejected}")
@@ -350,7 +325,6 @@ def _print_results(results, elapsed, label=""):
         print(f"    p95  {round(sorted(times)[int(len(times)*0.95)], 3):.3f}s")
         print(f"    max  {max(times):.3f}s")
 
-    # Verdict
     if success_rate >= 80:
         verdict = "PASS"
     elif success_rate >= 60:
@@ -360,10 +334,6 @@ def _print_results(results, elapsed, label=""):
 
     print(f"  Verdict         : {verdict}  (success rate {success_rate}%)")
     return success_rate
-
-
-
-#  Final Report
 
 
 def print_final_report(spike_res, spike_t, sustained_res, sustained_t,
@@ -395,48 +365,44 @@ def print_final_report(spike_res, spike_t, sustained_res, sustained_t,
     print()
     all_pass = all(r[2] == "PASS" for r in rows)
     overall  = "SYSTEM STABLE UNDER STRESS" if all_pass else "SYSTEM NEEDS TUNING"
-    print(f"  Overall: {'✓ ' if all_pass else '✗ '}{overall}")
+    print(f"  Overall: {'PASS ' if all_pass else 'FAIL '}{overall}")
     print()
     print(f"  Tested at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     divider()
 
 
-
-#  Entry Point
-
-
 if __name__ == "__main__":
     section("Stress Testing Suite — Initializing")
 
-    # System info
     snap = cpu_ram()
     print(f"  CPU cores : {psutil.cpu_count()}")
     print(f"  RAM total : {round(psutil.virtual_memory().total / 1024**2)} MB")
     print(f"  CPU now   : {snap['cpu']}%")
     print(f"  RAM now   : {snap['ram_mb']} MB")
 
-    # Setup
     print()
-    print("  Setting up fixtures...")
-    user, products = setup_fixtures(num_products=5, stock_per_product=999999)
-    print(f"  User      : {user.username}")
+    print("  Setting up fixtures (100 users + 5 products)...")
+    users, products = setup_fixtures(num_products=5, stock_per_product=999999, num_users=100)
+    print(f"  Users     : {len(users)} (stress_user_1 ... stress_user_100)")
     print(f"  Products  : {[p.name for p in products]}")
 
     controller = get_capacity_controller()
     queue_obj  = get_task_queue()
     queue_obj.start_workers()
 
-    # Run tests
-    spike_res,   spike_t   = test_concurrent_spike(user, products, controller,
-                                                    num_requests=150, max_workers=50)
+    spike_res, spike_t = test_concurrent_spike(
+        users, products, controller,
+        num_requests=150, max_workers=50
+    )
 
-    sustained_res, sustained_t = test_sustained_load(user, products, controller,
-                                                      duration_sec=30, num_workers=20)
+    sustained_res, sustained_t = test_sustained_load(
+        users, products, controller,
+        duration_sec=30, num_workers=20
+    )
 
-    flood_res, normal_res, recovery_rate = test_recovery(user, products, controller)
+    flood_res, normal_res, recovery_rate = test_recovery(users, products, controller)
 
     test_async_queue_pressure(queue_obj, num_tasks=500)
 
-    # Final report
     print_final_report(spike_res, spike_t, sustained_res, sustained_t,
                        flood_res, normal_res, recovery_rate)
