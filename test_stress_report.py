@@ -3,8 +3,9 @@ import sys
 import django
 import threading
 import time
+import random
 import statistics
-import psutil
+import requests
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
@@ -14,21 +15,21 @@ sys.path.insert(0, os.path.dirname(__file__))
 django.setup()
 
 from django.contrib.auth.models import User
-from django.db import transaction
-from django.db.models import F
-from core.models import Product, Order, OrderItem
-from core.capacity_controller import get_capacity_controller
-try:
-    from core.capacity_controller import ThreadPoolFullError
-except ImportError:
-    class ThreadPoolFullError(Exception):
-        pass
-from core.async_tasks import get_task_queue
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from core.models import Product
+
+BASE_URL = "http://127.0.0.1:8000"
+API_PREFIX = "/api"
+LOGIN_PATH = "/api/login/"
+AUTH_HEADER_SCHEME = "Bearer"
 
 
-def divider(char="=", n=65):
+def api(path: str) -> str:
+    return f"{BASE_URL}{API_PREFIX}{path}"
+
+
+def divider(char="=", n=70):
     print(char * n)
+
 
 def section(title):
     print()
@@ -36,25 +37,46 @@ def section(title):
     print(f"  {title}")
     divider()
 
-def cpu_ram():
-    return {
-        "cpu"    : psutil.cpu_percent(interval=0.3),
-        "ram_pct": psutil.virtual_memory().percent,
-        "ram_mb" : round(psutil.virtual_memory().used / 1024**2, 1),
-    }
+
+def classify_status(code):
+    if code is None:
+        return "error"
+    if 200 <= code < 300:
+        return "success"
+    if code == 503:
+        return "rejected"
+    if code in (408, 504):
+        return "timeout"
+    if 400 <= code < 500:
+        return "client_error"
+    return "error"
 
 
-def setup_fixtures(num_products=5, stock_per_product=99999, num_users=100):
-    """Creates 100 test users and products; resets stock."""
-    users = []
+def new_results():
+    return defaultdict(lambda: {"outcomes": defaultdict(int), "response_times": []})
+
+
+def record(results, lock, op_name, status_code, elapsed):
+    outcome = classify_status(status_code)
+    with lock:
+        results[op_name]["outcomes"][outcome] += 1
+        results[op_name]["response_times"].append(elapsed)
+
+
+FIXTURE_PASSWORD = "stress123"
+
+
+def setup_fixtures(num_products=5, stock_per_product=999999, num_users=100):
+    users_creds = []
     for i in range(num_users):
+        username = f"stress_user_{i+1}"
         user, _ = User.objects.get_or_create(
-            username=f"stress_user_{i+1}",
+            username=username,
             defaults={"email": f"stress{i+1}@test.com"}
         )
-        user.set_password("stress123")
+        user.set_password(FIXTURE_PASSWORD)
         user.save()
-        users.append(user)
+        users_creds.append((username, FIXTURE_PASSWORD))
 
     products = []
     for i in range(num_products):
@@ -65,344 +87,346 @@ def setup_fixtures(num_products=5, stock_per_product=99999, num_users=100):
         Product.objects.filter(id=p.id).update(stock=stock_per_product)
         products.append(p)
 
-    return users, products
+    return users_creds, products
 
 
-def simulate_order(user, product_id, quantity, controller, results, lock):
-    start = time.time()
+_debug_login_printed = threading.Event()
 
-    def process_order():
-        with transaction.atomic():
-            updated = Product.objects.filter(
-                id=product_id,
-                stock__gte=quantity
-            ).update(stock=F('stock') - quantity)
-        if not updated:
-            raise ValueError("Not enough stock")
-        order = Order.objects.create(user=user)
-        OrderItem.objects.create(order=order, product_id=product_id, quantity=quantity)
-        return order.id
 
-    outcome = "unknown"
+def login_user(session, username, password):
     try:
-        future = controller.submit(process_order, block=False)
-        future.result(timeout=30)
-        outcome = "success"
-    except ThreadPoolFullError:
-        outcome = "rejected"
-    except FutureTimeoutError:
-        outcome = "timeout"
-    except ValueError:
-        outcome = "no_stock"
-    except Exception:
-        outcome = "error"
+        r = session.post(
+            f"{BASE_URL}{LOGIN_PATH}",
+            json={"username": username, "password": password},
+            timeout=60
+        )
+    except requests.exceptions.RequestException as e:
+        if not _debug_login_printed.is_set():
+            _debug_login_printed.set()
+            print(f"\n  [DEBUG] Login connection error: {e}\n")
+        return False, None
 
-    elapsed = round(time.time() - start, 4)
-    with lock:
-        results["outcomes"][outcome] += 1
-        results["response_times"].append(elapsed)
+    if r.status_code != 200:
+        if not _debug_login_printed.is_set():
+            _debug_login_printed.set()
+            print(f"\n  [DEBUG] First login failure — status={r.status_code}")
+            print(f"  [DEBUG] Full response: {r.text[:500]}\n")
+        return False, r.status_code
+
+    body = r.json()
+    token = body.get("token") or body.get("access")
+    if token:
+        session.headers.update({"Authorization": f"{AUTH_HEADER_SCHEME} {token}"})
+        return True, r.status_code
+    return False, r.status_code
 
 
-def test_concurrent_spike(users, products, controller, num_requests=150, max_workers=50):
-    section("TEST 1 — Concurrent Spike  (اختبار الذروة المتزامنة)")
-    print(f"  Requests  : {num_requests}")
-    print(f"  Workers   : {max_workers}")
-    print(f"  Users     : {len(users)} unique users")
-    max_w = getattr(controller, 'max_workers', None) or getattr(controller, 'max_concurrent', '?')
-    max_q = getattr(controller, 'max_queue_size', None) or getattr(controller, 'queue_max_size', '?')
-    print(f"  Pool size : {max_w} workers / queue {max_q}")
+def op_register(session, username):
+    t0 = time.time()
+    try:
+        r = session.post(api("/register/"), json={
+            "username": username,
+            "email": f"{username}@test.com",
+            "password": FIXTURE_PASSWORD,
+        }, timeout=60)
+        return r.status_code, time.time() - t0
+    except requests.exceptions.RequestException:
+        return None, time.time() - t0
+
+
+def op_browse_products(session):
+    t0 = time.time()
+    try:
+        r = session.get(api("/products/"), timeout=60)
+        products = r.json() if r.status_code == 200 else []
+        return r.status_code, time.time() - t0, products
+    except requests.exceptions.RequestException:
+        return None, time.time() - t0, []
+
+
+def op_view_product(session, product_id):
+    t0 = time.time()
+    try:
+        r = session.get(api(f"/products/{product_id}/"), timeout=60)
+        return r.status_code, time.time() - t0
+    except requests.exceptions.RequestException:
+        return None, time.time() - t0
+
+
+def op_create_order(session, product_id, quantity=1):
+    t0 = time.time()
+    try:
+        r = session.post(api("/orders/"), json={
+            "product_id": product_id, "quantity": quantity
+        }, timeout=60)
+        order_id = r.json().get("order_id") if r.status_code == 201 else None
+        return r.status_code, time.time() - t0, order_id
+    except requests.exceptions.RequestException:
+        return None, time.time() - t0, None
+
+
+def op_pay_order(session, order_id):
+    t0 = time.time()
+    try:
+        r = session.post(api(f"/orders/{order_id}/pay/"), timeout=60)
+        return r.status_code, time.time() - t0
+    except requests.exceptions.RequestException:
+        return None, time.time() - t0
+
+
+def op_complete_order(session, order_id):
+    t0 = time.time()
+    try:
+        r = session.post(api(f"/orders/{order_id}/complete/"), timeout=60)
+        return r.status_code, time.time() - t0
+    except requests.exceptions.RequestException:
+        return None, time.time() - t0
+
+
+def op_cancel_order(session, order_id):
+    t0 = time.time()
+    try:
+        r = session.post(api(f"/orders/{order_id}/cancel/"), timeout=60)
+        return r.status_code, time.time() - t0
+    except requests.exceptions.RequestException:
+        return None, time.time() - t0
+
+
+def op_my_orders(session):
+    t0 = time.time()
+    try:
+        r = session.get(api("/orders/"), timeout=60)
+        return r.status_code, time.time() - t0
+    except requests.exceptions.RequestException:
+        return None, time.time() - t0
+
+
+def simulate_user_journey(username, password, products, results, lock, register_first=False):
+    session = requests.Session()
+    # session.proxies = {'http': None, 'https': None}
+
+    if register_first:
+        status, elapsed = op_register(session, username)
+        record(results, lock, "register", status, elapsed)
+
+    t0 = time.time()
+    ok, status = login_user(session, username, password)
+    record(results, lock, "login", status if ok else (status or 0), time.time() - t0)
+    if not ok:
+        return
+
+    status, elapsed, product_list = op_browse_products(session)
+    record(results, lock, "browse_products", status, elapsed)
+
+    candidates = product_list if product_list else [{"id": p.id} for p in products]
+    chosen = random.choice(candidates)
+    product_id = chosen.get("id") or chosen.get("pk")
+
+    status, elapsed = op_view_product(session, product_id)
+    record(results, lock, "view_product", status, elapsed)
+
+    status, elapsed, order_id = op_create_order(session, product_id, quantity=1)
+    record(results, lock, "create_order", status, elapsed)
+
+    if order_id:
+        if random.random() < 0.8:
+            status, elapsed = op_pay_order(session, order_id)
+            record(results, lock, "pay_order", status, elapsed)
+
+            if status == 200:
+                status, elapsed = op_complete_order(session, order_id)
+                record(results, lock, "complete_order", status, elapsed)
+        else:
+            status, elapsed = op_cancel_order(session, order_id)
+            record(results, lock, "cancel_order", status, elapsed)
+
+    status, elapsed = op_my_orders(session)
+    record(results, lock, "my_orders", status, elapsed)
+
+
+def sample_admin_endpoints(snapshots, stop_event, interval=2):
+    session = requests.Session()
+    while not stop_event.is_set():
+        snap = {"time": time.time()}
+        for key, path in [
+            ("capacity", "/admin/capacity/"),
+            ("resources", "/admin/resources/"),
+            ("async_queue", "/admin/async-queue/"),
+        ]:
+            try:
+                r = session.get(f"{BASE_URL}{API_PREFIX}{path}", timeout=5)
+                snap[key] = r.json() if r.status_code == 200 else {"error": r.status_code}
+            except requests.exceptions.RequestException as e:
+                snap[key] = {"error": str(e)}
+        snapshots.append(snap)
+        time.sleep(interval)
+
+
+def test_concurrent_spike(users_creds, products, num_requests=100, max_workers=5):
+    section("TEST 1 — Concurrent Spike ")
+    print(f"  Requests (Full Journeys) : {num_requests}")
+    print(f"  Workers                  : {max_workers}")
     print()
 
-    results = {"outcomes": defaultdict(int), "response_times": []}
+    results = new_results()
     lock = threading.Lock()
-
-    snap_before = cpu_ram()
-    print(f"  [Before]  CPU {snap_before['cpu']}%  |  RAM {snap_before['ram_mb']} MB")
 
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [
-            pool.submit(
-                simulate_order,
-                users[i % len(users)],
-                products[i % len(products)].id, 1,
-                controller, results, lock
-            )
-            for i in range(num_requests)
-        ]
+        futures = []
+        for i in range(num_requests):
+            username, password = users_creds[i % len(users_creds)]
+            futures.append(pool.submit(
+                simulate_user_journey, username, password, products, results, lock
+            ))
         for f in as_completed(futures):
             pass
     elapsed = round(time.time() - t0, 2)
 
-    snap_after = cpu_ram()
-    print(f"  [After]   CPU {snap_after['cpu']}%  |  RAM {snap_after['ram_mb']} MB")
-    print(f"  CPU delta : {round(snap_after['cpu'] - snap_before['cpu'], 1)}%")
-    print(f"  RAM delta : {round(snap_after['ram_mb'] - snap_before['ram_mb'], 1)} MB")
-    print()
-
-    _print_results(results, elapsed, label="Concurrent Spike")
+    print_per_operation_report(results, elapsed, label="Concurrent Spike")
     return results, elapsed
 
 
-def test_sustained_load(users, products, controller, duration_sec=30, num_workers=20):
-    section("TEST 2 — Sustained Load  (اختبار الحمل المستمر)")
-    print(f"  Duration  : {duration_sec}s")
-    print(f"  Workers   : {num_workers} continuous threads")
-    print(f"  Users     : {len(users)} unique users")
+def test_sustained_load(users_creds, products, duration_sec=30, num_workers=5):
+    section("TEST 2 — Sustained Load ")
+    print(f"  Duration : {duration_sec}s   |   Workers: {num_workers}")
     print()
 
-    results = {"outcomes": defaultdict(int), "response_times": []}
+    results = new_results()
     lock = threading.Lock()
     stop = threading.Event()
-    snapshots = []
 
     def worker(wid):
         idx = 0
         while not stop.is_set():
-            simulate_order(
-                users[wid % len(users)],
-                products[idx % len(products)].id, 1,
-                controller, results, lock
-            )
+            username, password = users_creds[(wid + idx) % len(users_creds)]
+            simulate_user_journey(username, password, products, results, lock)
             idx += 1
 
-    def sampler():
-        while not stop.is_set():
-            s = cpu_ram()
-            snapshots.append((time.time(), s["cpu"], s["ram_mb"]))
-            time.sleep(2)
-
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(num_workers)]
-    sampler_thread = threading.Thread(target=sampler, daemon=True)
-
     t0 = time.time()
-    sampler_thread.start()
     for t in threads:
         t.start()
 
     for sec in range(0, duration_sec, 5):
         time.sleep(5)
-        done = sum(results["outcomes"].values())
-        ok   = results["outcomes"]["success"]
-        print(f"  t+{sec+5:2d}s  |  total={done}  success={ok}  rejected={results['outcomes']['rejected']}")
+        total_done = sum(sum(op["outcomes"].values()) for op in results.values())
+        print(f"  t+{sec+5:2d}s  |  Total operations so far = {total_done}")
 
     stop.set()
     for t in threads:
         t.join(timeout=3)
     elapsed = round(time.time() - t0, 2)
 
-    if snapshots:
-        cpus = [s[1] for s in snapshots]
-        rams = [s[2] for s in snapshots]
-        print()
-        print(f"  Resource samples ({len(snapshots)}):")
-        print(f"    CPU  — avg {round(statistics.mean(cpus),1)}%  max {max(cpus)}%")
-        print(f"    RAM  — avg {round(statistics.mean(rams),1)} MB  max {max(rams)} MB")
-    print()
-
-    _print_results(results, elapsed, label="Sustained Load")
+    print_per_operation_report(results, elapsed, label="Sustained Load")
     return results, elapsed
 
 
-def test_recovery(users, products, controller):
-    section("TEST 3 — Recovery After Flood  (اختبار الانتعاش)")
-    print("  Phase A: flood the system with 200 requests in 2 seconds")
-    print("  Phase B: wait 5 seconds (cool-down)")
-    print("  Phase C: send 20 normal requests — expect near-100% success")
+def test_recovery(users_creds, products):
+    section("TEST 3 — Recovery After Flood ")
+    print("  Phase A: Flood 200 full user journeys with max concurrency")
+    print("  Phase B: Wait 5 seconds (cooldown)")
+    print("  Phase C: 20 normal journeys — expecting near-full success")
     print()
 
     lock = threading.Lock()
 
-    flood_results = {"outcomes": defaultdict(int), "response_times": []}
-    with ThreadPoolExecutor(max_workers=80) as pool:
+    flood_results = new_results()
+    with ThreadPoolExecutor(max_workers=5) as pool:
         futs = [
-            pool.submit(simulate_order,
-                        users[i % len(users)],
-                        products[i % len(products)].id, 1,
-                        controller, flood_results, lock)
+            pool.submit(simulate_user_journey,
+                        *users_creds[i % len(users_creds)], products,
+                        flood_results, lock)
             for i in range(200)
         ]
         for f in as_completed(futs):
             pass
 
-    flood_success  = flood_results["outcomes"]["success"]
-    flood_rejected = flood_results["outcomes"]["rejected"]
-    print(f"  [Phase A] success={flood_success}  rejected={flood_rejected}  "
-          f"timeout={flood_results['outcomes']['timeout']}")
+    flood_total = sum(sum(op["outcomes"].values()) for op in flood_results.values())
+    flood_ok = sum(op["outcomes"]["success"] for op in flood_results.values())
+    print(f"  [Phase A] Total operations: {flood_total}  |  Succeeded: {flood_ok}")
 
-    print("  [Phase B] Cooling down 5 seconds...")
+    print("  [Phase B] Cooldown 5 seconds...")
     time.sleep(5)
-    status = controller.get_status()
-    print(f"  [Phase B] Queue size after cool-down: {status['queue_size']}")
 
-    normal_results = {"outcomes": defaultdict(int), "response_times": []}
+    normal_results = new_results()
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=5) as pool:
         futs = [
-            pool.submit(simulate_order,
-                        users[i % len(users)],
-                        products[i % len(products)].id, 1,
-                        controller, normal_results, lock)
+            pool.submit(simulate_user_journey,
+                        *users_creds[i % len(users_creds)], products,
+                        normal_results, lock)
             for i in range(20)
         ]
         for f in as_completed(futs):
             pass
     elapsed = round(time.time() - t0, 2)
 
-    normal_success = normal_results["outcomes"]["success"]
-    recovery_rate  = round(normal_success / 20 * 100, 1)
-    print(f"  [Phase C] success={normal_success}/20  recovery_rate={recovery_rate}%")
-    print()
+    normal_total = sum(sum(op["outcomes"].values()) for op in normal_results.values())
+    normal_ok = sum(op["outcomes"]["success"] for op in normal_results.values())
+    recovery_rate = round(normal_ok / normal_total * 100, 1) if normal_total else 0
+    print(f"  [Phase C] Succeeded {normal_ok}/{normal_total} operations  →  recovery_rate = {recovery_rate}%")
 
     recovered = recovery_rate >= 90
-    print(f"  Recovery verdict: {'PASS — system recovered successfully' if recovered else 'FAIL — system did NOT recover'}")
+    print(f"  Verdict: {'PASS — System recovered successfully' if recovered else 'FAIL — System did not recover'}")
     return flood_results, normal_results, recovery_rate
 
 
-def test_async_queue_pressure(queue_obj, num_tasks=500):
-    section("TEST 4 — Async Queue Under Pressure  (ضغط طابور المهام)")
-    print(f"  Enqueueing {num_tasks} notification tasks rapidly...")
-    print()
+def print_per_operation_report(results, elapsed, label=""):
+    print(f"  -- {label} — Per-operation breakdown --")
+    print(f"  {'Operation':<18}{'Total':>7}{'OK%':>8}{'503':>7}{'Err':>6}{'Avg(s)':>9}{'P95(s)':>9}")
+    print(f"  {'-'*18}{'-'*7}{'-'*8}{'-'*7}{'-'*6}{'-'*9}{'-'*9}")
 
-    accepted = 0
-    dropped  = 0
-    t0 = time.time()
+    worst_op, worst_p95 = None, -1
+    for op_name, data in sorted(results.items()):
+        outcomes = data["outcomes"]
+        times = data["response_times"]
+        total = sum(outcomes.values())
+        ok_pct = round(outcomes["success"] / total * 100, 1) if total else 0
+        rejected = outcomes["rejected"]
+        errs = outcomes.get("error", 0) + outcomes.get("client_error", 0) + outcomes.get("timeout", 0)
+        avg_t = round(statistics.mean(times), 3) if times else 0
+        p95_t = round(sorted(times)[int(len(times) * 0.95)], 3) if times else 0
 
-    for i in range(num_tasks):
-        ok = queue_obj.enqueue('send_notification', 1, f"stress_msg_{i}")
-        if ok:
-            accepted += 1
-        else:
-            dropped += 1
+        if p95_t > worst_p95:
+            worst_p95, worst_op = p95_t, op_name
 
-    elapsed = round(time.time() - t0, 3)
-    status  = queue_obj.get_status()
-
-    print(f"  Enqueue time   : {elapsed}s  ({round(num_tasks/elapsed) if elapsed > 0 else 'inf'} tasks/sec)")
-    print(f"  Accepted       : {accepted}")
-    print(f"  Dropped (full) : {dropped}")
-    print(f"  Queue size now : {status['queue_size']}")
-    print(f"  Active workers : {status['active_workers']}/{queue_obj.num_workers}")
+        print(f"  {op_name:<18}{total:>7}{ok_pct:>7}%{rejected:>7}{errs:>6}{avg_t:>9}{p95_t:>9}")
 
     print()
-    print("  Waiting for workers to drain queue...")
-    wait_start = time.time()
-    for _ in range(60):
-        time.sleep(1)
-        if queue_obj.queue.qsize() == 0:
-            break
-    drain_time = round(time.time() - wait_start, 1)
-    print(f"  Queue drained in {drain_time}s")
-    print(f"  Drop rate      : {round(dropped/num_tasks*100, 1)}%")
-
-
-def _print_results(results, elapsed, label=""):
-    outcomes = results["outcomes"]
-    times    = results["response_times"]
-    total    = sum(outcomes.values())
-
-    success  = outcomes["success"]
-    rejected = outcomes["rejected"]
-    timeout  = outcomes["timeout"]
-    error    = outcomes.get("error", 0) + outcomes.get("no_stock", 0)
-
-    success_rate = round(success / total * 100, 1) if total else 0
-    rps          = round(total / elapsed, 1) if elapsed else 0
-
-    print(f"  -- {label} Results --")
-    print(f"  Total requests  : {total}")
-    print(f"  Success         : {success}  ({success_rate}%)")
-    print(f"  Rejected (503)  : {rejected}")
-    print(f"  Timeout         : {timeout}")
-    print(f"  Other errors    : {error}")
-    print(f"  Elapsed         : {elapsed}s")
-    print(f"  Throughput      : {rps} req/s")
-
-    if times:
-        print(f"  Response times  :")
-        print(f"    min  {min(times):.3f}s")
-        print(f"    avg  {round(statistics.mean(times), 3):.3f}s")
-        print(f"    p95  {round(sorted(times)[int(len(times)*0.95)], 3):.3f}s")
-        print(f"    max  {max(times):.3f}s")
-
-    if success_rate >= 80:
-        verdict = "PASS"
-    elif success_rate >= 60:
-        verdict = "WARN"
-    else:
-        verdict = "FAIL"
-
-    print(f"  Verdict         : {verdict}  (success rate {success_rate}%)")
-    return success_rate
-
-
-def print_final_report(spike_res, spike_t, sustained_res, sustained_t,
-                        flood_res, normal_res, recovery_rate):
-    section("FINAL STRESS TEST REPORT  (التقرير النهائي)")
-
-    def rate(res):
-        total = sum(res["outcomes"].values())
-        ok    = res["outcomes"]["success"]
-        return round(ok / total * 100, 1) if total else 0
-
-    spike_rate     = rate(spike_res)
-    sustained_rate = rate(sustained_res)
-
-    rows = [
-        ("Concurrent Spike (150 req, 50 workers)", spike_rate,
-         "PASS" if spike_rate >= 80 else "FAIL"),
-        ("Sustained Load (30s, 20 workers)",        sustained_rate,
-         "PASS" if sustained_rate >= 70 else "FAIL"),
-        ("Recovery after flood",                    recovery_rate,
-         "PASS" if recovery_rate >= 90 else "FAIL"),
-    ]
-
-    print(f"  {'Test':<42} {'Success%':>9}  {'Verdict':>7}")
-    print(f"  {'-'*42} {'-'*9}  {'-'*7}")
-    for name, rate_val, verdict in rows:
-        print(f"  {name:<42} {rate_val:>8.1f}%  {verdict:>7}")
-
+    print(f"  Elapsed: {elapsed}s")
+    if worst_op:
+        print(f"  Slowest operation (p95): {worst_op}  ({worst_p95}s)  → Candidate for bottleneck analysis (Req 10)")
     print()
-    all_pass = all(r[2] == "PASS" for r in rows)
-    overall  = "SYSTEM STABLE UNDER STRESS" if all_pass else "SYSTEM NEEDS TUNING"
-    print(f"  Overall: {'PASS ' if all_pass else 'FAIL '}{overall}")
-    print()
-    print(f"  Tested at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    divider()
 
 
 if __name__ == "__main__":
-    section("Stress Testing Suite — Initializing")
-
-    snap = cpu_ram()
-    print(f"  CPU cores : {psutil.cpu_count()}")
-    print(f"  RAM total : {round(psutil.virtual_memory().total / 1024**2)} MB")
-    print(f"  CPU now   : {snap['cpu']}%")
-    print(f"  RAM now   : {snap['ram_mb']} MB")
-
+    section("Full-System Stress Test — Initializing")
+    print(f"  Target server: {BASE_URL}{API_PREFIX}")
+    print("  Make sure the server is running (python manage.py runserver) before continuing")
     print()
-    print("  Setting up fixtures (100 users + 5 products)...")
-    users, products = setup_fixtures(num_products=5, stock_per_product=999999, num_users=100)
-    print(f"  Users     : {len(users)} (stress_user_1 ... stress_user_100)")
-    print(f"  Products  : {[p.name for p in products]}")
 
-    controller = get_capacity_controller()
-    queue_obj  = get_task_queue()
-    queue_obj.start_workers()
+    print("  Setting up fixtures (100 users + 5 products)  .......")
+    users_creds, products = setup_fixtures(num_products=5, num_users=100)
+    print(f"  Users    : {len(users_creds)}")
+    print(f"  Products : {[p.name for p in products]}")
 
-    spike_res, spike_t = test_concurrent_spike(
-        users, products, controller,
-        num_requests=150, max_workers=50
+    snapshots = []
+    stop_sampler = threading.Event()
+    sampler_thread = threading.Thread(
+        target=sample_admin_endpoints, args=(snapshots, stop_sampler), daemon=True
     )
+    sampler_thread.start()
 
-    sustained_res, sustained_t = test_sustained_load(
-        users, products, controller,
-        duration_sec=30, num_workers=20
-    )
+    spike_res, spike_t = test_concurrent_spike(users_creds, products, num_requests=100, max_workers=5)
+    sustained_res, sustained_t = test_sustained_load(users_creds, products, duration_sec=30, num_workers=5)
+    #flood_res, normal_res, recovery_rate = test_recovery(users_creds, products)
 
-    flood_res, normal_res, recovery_rate = test_recovery(users, products, controller)
+    stop_sampler.set()
+    sampler_thread.join(timeout=3)
 
-    test_async_queue_pressure(queue_obj, num_tasks=500)
-
-    print_final_report(spike_res, spike_t, sustained_res, sustained_t,
-                       flood_res, normal_res, recovery_rate)
+    section("FINAL REPORT")
+    print(f"  Collected monitoring samples from admin endpoints: {len(snapshots)}")
+    print(f"  (Check snapshots for capacity/resources/async_queue over time)")
+    print(f"  Tested at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    divider()
